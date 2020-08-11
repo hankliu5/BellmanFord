@@ -30,10 +30,6 @@
 // for timing
 #include <sys/time.h>
 
-using std::string;
-using std::cout;
-using std::endl;
-
 #define INF INT_MAX
 #define THREADS_PER_BLOCK 1024
 
@@ -53,28 +49,36 @@ using std::endl;
 }
 
 void get_outedges(int64_t* graph, int64_t* outedges, size_t interval_st, size_t num_of_subvertices, size_t num_of_vertices) {
-    memcpy(outedges, (graph + interval_st * num_of_vertices), sizeof(int64_t) * num_of_subvertices * num_of_vertices);
+	cudaMemcpy(outedges, (graph + interval_st * num_of_vertices), sizeof(int64_t) * num_of_subvertices * num_of_vertices, cudaMemcpyHostToDevice);
 }
 
-void get_inedges(int64_t* graph, int64_t* inedges, size_t interval_st, size_t interval_en, size_t num_of_vertices) {
-    size_t i, j, row;
-    int64_t *graph_ptr, *inedges_ptr;
+void get_inedges(int64_t* graph, int64_t* inedges, size_t interval_st, size_t num_of_subvertices, size_t num_of_vertices) {
+    size_t i;
+	int64_t *graph_ptr = graph + interval_st;
+	int64_t *inedges_ptr = inedges;
+	
     // in column favor but transpose into row.
     for (i = 0; i < num_of_vertices; i++) {
-        for (row = 0, j = interval_st; j < interval_en; row++, j++) {
-            // printf("i: %lu, j: %lu, row: %lu\n", i, j, row);
-            *(inedges + row * num_of_vertices + i) = *(graph + i * num_of_vertices + j);
-        }
+		cudaMemcpy(inedges_ptr, graph_ptr, sizeof(int64_t) * num_of_subvertices, cudaMemcpyHostToDevice);
+		inedges_ptr += num_of_subvertices;
+		graph_ptr += num_of_vertices;
     }
 }
 
-__global__ void bellman_ford_one_iter(size_t n, int64_t *d_mat, int64_t *d_dist, bool *d_has_next){
-	size_t global_tid = blockDim.x * blockIdx.x + threadIdx.x;
-	size_t v = global_tid;
+__global__ void bellman_ford_one_iter(size_t n, size_t sub_n, size_t st, int64_t *d_mat, int64_t *d_dist, bool *d_has_next){
+	size_t v = blockDim.x * blockIdx.x + threadIdx.x;
 	size_t u;
-	if (global_tid >= n) return;
-	for(u = 0; u < n; u++){
-		int64_t weight = d_mat[u * n + v]; // row is src, col is dst
+	int64_t weight, new_dist;
+	int64_t *node;
+	
+	if (v > sub_n) {
+		return;
+	}
+	
+	node = d_mat + v;
+	v = v + st;
+	for (u = 0; u < n; u++){
+		int64_t weight = node[u * sub_n]; // row is src, col is dst
 		if (weight > 0) {
 			int64_t new_dist = d_dist[u] + weight;
 			if(new_dist < d_dist[v]){
@@ -89,48 +93,51 @@ __global__ void bellman_ford_one_iter(size_t n, int64_t *d_mat, int64_t *d_dist,
  * Bellman-Ford algorithm. Find the shortest path from vertex 0 to other vertices.
  * @param blockPerGrid number of blocks per grid
  * @param threadsPerBlock number of threads per block
- * @param n input size
+ * @param num_of_vertices input size
  * @param *mat input adjacency matrix
  * @param *dist distance array
  * @param *has_negative_cycle a bool variable to recode if there are negative cycles
  */
-void bellman_ford(size_t n, int64_t *mat, int64_t *dist, bool *has_negative_cycle) {
+void bellman_ford(size_t num_of_vertices, size_t num_of_subvertices, int64_t *mat, int64_t *dist, bool *has_negative_cycle) {
 	size_t iter_num = 0;
 	int64_t *d_mat, *d_dist;
 	bool *d_has_next, h_has_next;
 	size_t i;
+	const size_t stripe_sz = num_of_vertices * num_of_subvertices * sizeof(int64_t);
 
-	cudaMalloc(&d_mat, sizeof(int64_t) * n * n);
-	cudaMalloc(&d_dist, sizeof(int64_t) * n);
+	cudaMalloc(&d_mat, stripe_sz);
+	cudaMalloc(&d_dist, sizeof(int64_t) * num_of_vertices);
 	cudaMalloc(&d_has_next, sizeof(bool));
 
 	*has_negative_cycle = false;
 
-	for(i = 0 ; i < n; i++){
+	for(i = 0 ; i < num_of_vertices; i++){
 		dist[i] = INF;
 	}
 
 	dist[0] = 0;
-	cudaMemcpy(d_mat, mat, sizeof(int64_t) * n * n, cudaMemcpyHostToDevice);
-	cudaMemcpy(d_dist, dist, sizeof(int64_t) * n, cudaMemcpyHostToDevice);
+	cudaMemcpy(d_dist, dist, sizeof(int64_t) * num_of_vertices, cudaMemcpyHostToDevice);
 
 	do {
 		h_has_next = false;
 		cudaMemcpy(d_has_next, &h_has_next, sizeof(bool), cudaMemcpyHostToDevice);
-
-		bellman_ford_one_iter<<<(n+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(n, d_mat, d_dist, d_has_next);
-		CHECK(cudaDeviceSynchronize());
+		for (i = 0; i < num_of_vertices; i += num_of_subvertices) {
+			get_inedges(mat, d_mat, i, num_of_subvertices, num_of_vertices);
+			bellman_ford_one_iter<<<(num_of_subvertices+THREADS_PER_BLOCK-1)/THREADS_PER_BLOCK, THREADS_PER_BLOCK>>>(num_of_vertices, num_of_subvertices, i, d_mat, d_dist, d_has_next);
+			CHECK(cudaDeviceSynchronize());
+		}
 		cudaMemcpy(&h_has_next, d_has_next, sizeof(bool), cudaMemcpyDeviceToHost);
 
 		iter_num++;
-		if(iter_num >= n-1){
+
+		if (iter_num >= num_of_vertices - 1){
 			*has_negative_cycle = true;
 			break;
 		}
 	} while (h_has_next);
 
-	if(! *has_negative_cycle){
-		cudaMemcpy(dist, d_dist, sizeof(int64_t) * n, cudaMemcpyDeviceToHost);
+	if (! *has_negative_cycle){
+		cudaMemcpy(dist, d_dist, sizeof(int64_t) * num_of_vertices, cudaMemcpyDeviceToHost);
 	}
 
 	cudaFree(d_mat);
@@ -143,9 +150,9 @@ void bellman_ford(size_t n, int64_t *mat, int64_t *dist, bool *has_negative_cycl
  * maybe we can borrow the log system from graphchi?
  */
 int main(int argc, char** argv) {
-    int64_t *graph, *outedges, *inedges;
+    int64_t *graph;
     int fd;
-    size_t num_of_vertices, num_of_subvertices, niters;
+    size_t num_of_vertices, num_of_subvertices;
     size_t iter, st, i;
     
     // result
@@ -165,20 +172,13 @@ int main(int argc, char** argv) {
     fd = open(argv[1], O_RDONLY);
     num_of_vertices = (size_t) atoi(argv[2]);
     num_of_subvertices = (size_t) atoi(argv[3]);
-    niters = (size_t) atoi(argv[4]);
     graph = (int64_t *) mmap(NULL, sizeof(int64_t) * num_of_vertices * num_of_vertices, PROT_READ, MAP_PRIVATE, fd, 0);
 
     // calculate the largest stripe we can have
     // Assume we have 1 GB (like graphchi), and at least we can contain one row and one column of the graph
     // and assume we those numbers are the power of 2
-    const size_t stripe_sz = num_of_vertices * num_of_subvertices * sizeof(int64_t);
     // num_of_subvertices = 32;
     printf("num_of_subvertices: %lu\n", num_of_subvertices);
-
-    // subgraph initialization
-    outedges = (int64_t *) malloc(stripe_sz);
-    inedges = (int64_t *) malloc(stripe_sz);
-    printf("graph: %p, outedges: %p, inedges: %p\n", graph, outedges, inedges);
 
     // PR initialization
     vertices = (int64_t *) calloc(sizeof(int64_t), num_of_vertices);
@@ -187,19 +187,26 @@ int main(int argc, char** argv) {
         vertices[i] = INF;
     }
 
-	bellman_ford(num_of_vertices, graph, vertices, &has_negative_cycle);
+	bellman_ford(num_of_vertices, num_of_subvertices, graph, vertices, &has_negative_cycle);
 
-    FILE *fp = fopen("log.txt", "w");
-    for (i = 0; i < num_of_vertices; i++) {
-        fprintf(fp, "%lu %lu\n", i, vertices[i]);
-    }
+	FILE *fp = fopen("log.txt", "w");
+
+	if (!has_negative_cycle) {
+		for (i = 0; i < num_of_vertices; i++) {
+			if (vertices[i] > INF) {
+				vertices[i] = INF;
+			}
+			fprintf(fp, "%lu %lu\n", i, vertices[i]);
+		}
+	} else {
+		fprintf(fp, "FOUND NEGATIVE CYCLE!\n");
+	}
+
     fclose(fp);
     // cleanup
     munmap(graph, sizeof(int64_t) * num_of_vertices * num_of_vertices);
     close(fd);
 
-    free(outedges);
-    free(inedges);
     free(vertices);
 
     return 0;
